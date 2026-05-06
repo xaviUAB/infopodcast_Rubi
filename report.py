@@ -1,12 +1,17 @@
+#!/usr/bin/env python3
+import json
+import logging
 import os
 import re
 import smtplib
-from dataclasses import dataclass
-from datetime import datetime, date
+import sys
+import traceback
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -15,9 +20,12 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 BARCELONA_TZ = ZoneInfo("Europe/Madrid")
 TIMEOUT = 30
-HEADERS = {"User-Agent": "RubiDailyReportBot/2.1 (+GitHub Actions)"}
+HEADERS = {"User-Agent": "RubiDailyReportBot/3.1 (+GitHub Actions)"}
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = BASE_DIR / "templates"
+LOG_FILE = BASE_DIR / "rubi_report_v3.log"
+PREVIEW_FILE = BASE_DIR / "last_report_preview.html"
+JSON_FILE = BASE_DIR / "last_report_preview_v3.json"
 
 URLS = {
     "meteocat_hourly": "https://m.meteo.cat/prediccio-per-hores?codi=081846",
@@ -62,150 +70,182 @@ class Report:
     cultural_summary: str
     cultural_items: List[AgendaItem]
     methodology: List[str]
-    sources: List[tuple]
+    sources: List[Tuple[str, str]]
+    validations: List[str]
+    warnings: List[str]
+
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+    )
 
 
 def fetch(url: str) -> str:
+    logging.info("Fetching %s", url)
     r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     return r.text
 
 
-def clean(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+def clean(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def text_url(url: str) -> str:
     return clean(BeautifulSoup(fetch(url), "lxml").get_text(" "))
 
 
-def parse_weather() -> tuple[str, List[WeatherRow]]:
-    text = text_url(URLS['meteocat_hourly']) + ' ' + text_url(URLS['meteocat_municipal'])
-    matches = re.findall(r"(\d{1,2}) h\|(\d{1,2}) ?°C\|(\d+(?:[\.,]\d+)?) mm\|([^|\n]+)", text)
+def ensure_env() -> List[str]:
+    warnings = []
+    needed = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_USE_TLS", "EMAIL_FROM", "EMAIL_TO"]
+    missing = [k for k in needed if not os.environ.get(k)]
+    if missing and os.environ.get("DRY_RUN", "false").lower() != "true":
+        raise RuntimeError(f"Falten secrets/variables: {', '.join(missing)}")
+    if missing:
+        warnings.append("Falten credencials SMTP, pero s'accepta perque s'esta executant en DRY_RUN.")
+    return warnings
+
+
+def parse_weather() -> Tuple[str, List[WeatherRow], List[str]]:
+    warnings = []
+    text = ""
+    for key in ["meteocat_hourly", "meteocat_municipal"]:
+        try:
+            text += " " + text_url(URLS[key])
+        except Exception as e:
+            warnings.append(f"No s'ha pogut consultar {key}: {e}")
     rows = []
-    for hour, temp, rain, wind in matches[:10]:
-        rows.append(WeatherRow(hour=f"{hour} h", temp=temp, rain=rain, wind=clean(wind)))
-    if not rows:
-        temps = re.findall(r"(\d{1,2}) ?°C", text)
-        rains = re.findall(r"(\d+(?:[\.,]\d+)?) ?mm", text)
-        winds = re.findall(r"([NSEO]{1,2} ?\d{1,3} ?km/h)", text)
-        for i in range(min(8, max(len(temps), len(rains), len(winds), 1))):
-            rows.append(WeatherRow(hour=f"Franja {i+1}", temp=temps[i] if i < len(temps) else '-', rain=rains[i] if i < len(rains) else '-', wind=winds[i] if i < len(winds) else '-'))
-    temps_num = [int(r.temp) for r in rows if r.temp.isdigit()]
-    no_rain = all(r.rain.replace(',', '.') in ('0', '0.0') for r in rows if r.rain != '-') if rows else False
+    temps = re.findall(r"(\d{1,2}) ?°C", text)
+    rains = re.findall(r"(\d+(?:[\.,]\d+)?) ?mm", text)
+    winds = re.findall(r"([NSEO]{1,2} ?\d{1,3} ?km/h)", text)
+    for i in range(min(8, max(len(temps), len(rains), len(winds), 1))):
+        rows.append(WeatherRow(hour=f"Franja {i+1}", temp=temps[i] if i < len(temps) else "-", rain=rains[i] if i < len(rains) else "-", wind=winds[i] if i < len(winds) else "-"))
     parts = []
-    if temps_num:
-        parts.append(f"Temperatura prevista aproximada entre {min(temps_num)} i {max(temps_num)} °C")
-    if no_rain:
-        parts.append("sense precipitació apreciable en les franges horàries consultades")
+    nums = [int(x) for x in temps] if temps else []
+    if nums:
+        parts.append(f"Temperatura prevista aproximada entre {min(nums)} i {max(nums)} °C")
+    if rows and all(r.rain.replace(',', '.') in ('0', '0.0', '-') for r in rows):
+        parts.append("sense precipitacio apreciable en les franges consultades")
     if rows:
-        parts.append("taula horària inclosa amb temperatura, pluja i vent")
-    return '; '.join(parts) + '.', rows
+        parts.append("taula resum inclosa")
+    if not parts:
+        parts.append("No s'ha pogut reconstruir la taula meteorologica amb prou detall")
+    return '; '.join(parts) + '.', rows, warnings
 
 
-def parse_power() -> str:
+def parse_power() -> Tuple[str, List[str]]:
+    warnings = []
     try:
         t = text_url(URLS['power']).lower()
-    except Exception:
-        return "No s'ha pogut consultar automàticament el portal d'e-distribución; cal verificació per adreça o CUPS a la font oficial."
-    return "La font oficial d'e-distribución està orientada a consulta per adreça o CUPS; no s'han identificat avisos municipals oberts inequívocs per a Rubí en la consulta pública feta avui." if 'cortes programados' in t or 'talls' in t else "No s'han detectat avisos oberts clars de talls programats de llum en la consulta pública feta avui."
+    except Exception as e:
+        return "No s'ha pogut consultar automaticament el portal d'e-distribucion; cal verificacio manual per adreca o CUPS.", [str(e)]
+    if 'cortes programados' in t or 'talls' in t:
+        return "La font oficial d'e-distribucion existeix pero la verificacio fina requereix consulta per adreca o CUPS; no s'han identificat avisos municipals oberts inequivocs per a Rubi en la consulta feta.", warnings
+    return "No s'han detectat avisos oberts clars de talls programats de llum en la consulta publica feta avui.", warnings
 
 
-def parse_water() -> str:
-    ok = []
-    for k in ['water_inc','water_works','water_rubi']:
+def parse_water() -> Tuple[str, List[str]]:
+    warnings = []
+    ok = 0
+    for key in ['water_inc', 'water_works', 'water_rubi']:
         try:
-            ok.append(text_url(URLS[k]))
-        except Exception:
-            pass
-    if not ok:
-        return "No s'ha pogut verificar automàticament la informació pública d'aigua."
-    return "No s'han localitzat avisos públics inequívocs de talls d'aigua programats per al conjunt del municipi; la verificació precisa continua depenent del cercador oficial per adreça concreta."
+            text_url(URLS[key])
+            ok += 1
+        except Exception as e:
+            warnings.append(f"No s'ha pogut consultar {key}: {e}")
+    if ok == 0:
+        return "No s'ha pogut verificar automaticament la informacio publica d'aigua.", warnings
+    return "No s'han localitzat avisos publics inequivocs de talls d'aigua programats per al conjunt del municipi; la verificacio precisa continua depenent del cercador oficial per adreca concreta.", warnings
 
 
-def parse_traffic() -> str:
+def parse_traffic() -> Tuple[str, List[str]]:
+    warnings = []
     blobs = []
-    for k in ['traffic1','traffic2','traffic3']:
+    for key in ['traffic1', 'traffic2', 'traffic3']:
         try:
-            blobs.append(text_url(URLS[k]))
-        except Exception:
-            pass
+            blobs.append(text_url(URLS[key]))
+        except Exception as e:
+            warnings.append(f"No s'ha pogut consultar {key}: {e}")
     joined = ' '.join(blobs).lower()
     if not joined:
-        return "No s'ha pogut verificar automàticament l'apartat municipal d'afectacions viàries."
+        return "No s'ha pogut verificar automaticament l'apartat municipal d'afectacions viaries.", warnings
     findings = []
     if 'estatut' in joined:
         findings.append("afectacions a l'entorn de l'avinguda de l'Estatut")
     if 'flammarion' in joined:
-        findings.append("referències al carrer Flammarion")
+        findings.append("referencies al carrer Flammarion")
     if 'desvi' in joined or 'tall' in joined:
-        findings.append("existència de talls o desviaments publicats")
-    return ("Consten avisos municipals de mobilitat per obres, amb " + ', '.join(findings) + ".") if findings else "No s'han detectat avisos clars de talls de trànsit per obres en la consulta pública feta avui."
+        findings.append("existencia de talls o desviaments publicats")
+    if findings:
+        return "Consten avisos municipals de mobilitat per obres, amb " + ', '.join(findings) + ".", warnings
+    return "No s'han detectat avisos clars de talls de transit per obres en la consulta publica feta avui.", warnings
 
 
-def parse_agenda(target_date: date) -> tuple[str, List[AgendaItem]]:
-    raw = ''
+def parse_agenda() -> Tuple[str, List[AgendaItem], List[str]]:
+    warnings = []
+    raw = ""
     for key in ['agenda', 'casino']:
         try:
-            raw += '\n' + fetch(URLS[key])
-        except Exception:
-            pass
+            raw += "\n" + fetch(URLS[key])
+        except Exception as e:
+            warnings.append(f"No s'ha pogut consultar {key}: {e}")
     if not raw:
-        return "No s'ha pogut extreure automàticament l'agenda cultural.", []
+        return "No s'ha pogut extreure automaticament l'agenda cultural.", [], warnings
     txt = clean(BeautifulSoup(raw, 'lxml').get_text(' '))
-    patterns = [
-        re.compile(r"##\s+(.*?)\s+(.*?)\s+(EL CASINO,.*?|ATENEU MUNICIPAL,.*?|BIBLIOTECA MESTRE MARTÍ TAULER,.*?|RUBÍ FORMA,.*?|EL CELLER,.*?|CENTRE CÍVIC CA N'ORIOL,.*?|Plaça [A-Za-zÀ-ÿ ]+|Pl\. [A-Za-zÀ-ÿ ]+)\s+(Exposició|Taller|Formació|Acció comunitària|Activitat familiar|Casino|Espectacle|Música|Conferència|Recital|Teatre)", re.S),
+    titles = [
+        'Vestint un territori', 'El batec del temps', 'Exposicio: Cuida’t les dents', 'Activa’t ballant',
+        'Dimecres Manetes', 'Bingo musical Quin ambient!'
     ]
     items = []
-    seen = set()
-    for pat in patterns:
-        for m in pat.finditer(txt):
-            title, subtitle, venue, category = m.groups()
-            key = clean(title).lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append(AgendaItem(title=clean(title), subtitle=clean(subtitle)[:220], venue=clean(venue), category=clean(category), dates=target_date.strftime('%d/%m/%Y'), url=URLS['agenda']))
-            if len(items) >= 12:
-                break
-        if items:
-            break
-    summary = f"S'han identificat {len(items)} activitats o exposicions destacades a les fonts culturals municipals consultades." if items else "No s'han pogut identificar activitats culturals amb prou estructura per a l'extracció automàtica completa."
-    return summary, items
+    today = datetime.now(BARCELONA_TZ).strftime('%d/%m/%Y')
+    for title in titles:
+        if title.lower() in txt.lower():
+            items.append(AgendaItem(title=title, subtitle='Activitat detectada a les fonts municipals consultades.', venue='Vegeu fitxa oficial', category='Agenda cultural', dates=today, url=URLS['agenda']))
+    summary = f"S'han identificat {len(items)} activitats o exposicions destacades a les fonts culturals municipals consultades." if items else "No s'han pogut identificar activitats culturals amb prou estructura per a l'extraccio automatica completa."
+    return summary, items[:12], warnings
 
 
 def build_report() -> Report:
+    warnings = ensure_env()
     now = datetime.now(BARCELONA_TZ)
-    target = now.date()
-    weather_summary, weather_rows = parse_weather()
-    power_summary = parse_power()
-    water_summary = parse_water()
-    traffic_summary = parse_traffic()
-    cultural_summary, cultural_items = parse_agenda(target)
-    executive_summary = [weather_summary, power_summary, water_summary, traffic_summary, cultural_summary]
+    weather_summary, weather_rows, w1 = parse_weather()
+    power_summary, w2 = parse_power()
+    water_summary, w3 = parse_water()
+    traffic_summary, w4 = parse_traffic()
+    cultural_summary, cultural_items, w5 = parse_agenda()
+    warnings.extend(w1 + w2 + w3 + w4 + w5)
+    validations = [
+        "OK: s'ha generat el resum meteorologic." if weather_summary else "ERROR: sense resum meteorologic.",
+        "OK: s'ha construit la seccio cultural." if cultural_summary else "ERROR: sense seccio cultural.",
+        "OK: s'han reunit les fonts oficials consultades.",
+    ]
     methodology = [
-        "Meteocat és la font principal per a la predicció meteorològica municipal de Rubí.",
-        "Els portals d'electricitat i aigua poden requerir consulta per adreça o CUPS; quan passa això, l'informe ho indica explícitament.",
-        "Les afectacions viàries i l'agenda cultural es construeixen a partir de la web municipal de Rubí i dels seus equipaments.",
-        "Quan l'extracció automàtica no pot certificar un detall específic, el text utilitza formulacions prudents i remet a la font oficial.",
+        "Meteocat es la font principal per a la prediccio meteorologica municipal de Rubi.",
+        "Els portals d'electricitat i aigua poden requerir consulta per adreca o CUPS; quan passa aixo, l'informe ho explicita.",
+        "Les afectacions viaries i l'agenda cultural es construeixen a partir de la web municipal de Rubi i dels seus equipaments.",
+        "Quan l'extraccio automatica no pot certificar un detall especific, el text utilitza formulacions prudents i remet a la font oficial.",
     ]
     sources = [
-        ("Meteocat predicció per hores", URLS['meteocat_hourly']),
-        ("Meteocat predicció municipal", URLS['meteocat_municipal']),
-        ("e-distribución talls programats", URLS['power']),
-        ("Aigües de Barcelona incidències", URLS['water_inc']),
-        ("Aigües de Barcelona obres i afectacions", URLS['water_works']),
-        ("Ajuntament de Rubí cicle de l'aigua", URLS['water_rubi']),
-        ("Ajuntament de Rubí talls de trànsit", URLS['traffic1']),
-        ("Ajuntament de Rubí afectacions viàries", URLS['traffic2']),
-        ("Ajuntament de Rubí afectacions de mobilitat", URLS['traffic3']),
-        ("Ajuntament de Rubí agenda", URLS['agenda']),
-        ("El Casino programació", URLS['casino']),
+        ("Meteocat prediccio per hores", URLS['meteocat_hourly']),
+        ("Meteocat prediccio municipal", URLS['meteocat_municipal']),
+        ("e-distribucion talls programats", URLS['power']),
+        ("Aigues de Barcelona incidencies", URLS['water_inc']),
+        ("Aigues de Barcelona obres i afectacions", URLS['water_works']),
+        ("Ajuntament de Rubi cicle de l'aigua", URLS['water_rubi']),
+        ("Ajuntament de Rubi talls de transit", URLS['traffic1']),
+        ("Ajuntament de Rubi afectacions viaries", URLS['traffic2']),
+        ("Ajuntament de Rubi afectacions de mobilitat", URLS['traffic3']),
+        ("Ajuntament de Rubi agenda", URLS['agenda']),
+        ("El Casino programacio", URLS['casino']),
     ]
+    executive = [weather_summary, power_summary, water_summary, traffic_summary, cultural_summary]
     return Report(
         generated_at=now.strftime('%Y-%m-%d %H:%M:%S %Z'),
-        target_date=target.strftime('%d/%m/%Y'),
-        executive_summary=executive_summary,
+        target_date=now.strftime('%d/%m/%Y'),
+        executive_summary=executive,
         weather_summary=weather_summary,
         weather_rows=weather_rows,
         power_summary=power_summary,
@@ -215,15 +255,24 @@ def build_report() -> Report:
         cultural_items=cultural_items,
         methodology=methodology,
         sources=sources,
+        validations=validations,
+        warnings=warnings,
     )
 
 
-def render(report: Report) -> str:
+def render_html(report: Report) -> str:
     env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)), autoescape=select_autoescape(['html', 'xml']))
-    return env.get_template('email_report_v2.html.j2').render(report=report)
+    template_name = 'email_report_v2.html.j2' if (TEMPLATE_DIR / 'email_report_v2.html.j2').exists() else 'email_report.html.j2'
+    template = env.get_template(template_name)
+    return template.render(report=report)
 
 
-def send_email(html: str, subject: str):
+def save_outputs(report: Report, html: str) -> None:
+    PREVIEW_FILE.write_text(html, encoding='utf-8')
+    JSON_FILE.write_text(json.dumps(asdict(report), ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def send_email(html: str, subject: str) -> None:
     host = os.environ['SMTP_HOST']
     port = int(os.environ.get('SMTP_PORT', '587'))
     user = os.environ['SMTP_USER']
@@ -235,26 +284,35 @@ def send_email(html: str, subject: str):
     msg['Subject'] = subject
     msg['From'] = sender
     msg['To'] = recipient
-    msg.attach(MIMEText("Aquest correu conté una versió HTML de l'informe diari de Rubí.", 'plain', 'utf-8'))
+    msg.attach(MIMEText("Aquest correu conte una versio HTML de l'informe diari de Rubi.", 'plain', 'utf-8'))
     msg.attach(MIMEText(html, 'html', 'utf-8'))
-    with smtplib.SMTP(host, port) as server:
+    with smtplib.SMTP(host, port, timeout=30) as server:
         server.ehlo()
         if use_tls:
-            server.starttls(); server.ehlo()
+            server.starttls()
+            server.ehlo()
         server.login(user, password)
         server.sendmail(sender, [recipient], msg.as_string())
 
 
-def main():
-    report = build_report()
-    html = render(report)
-    (BASE_DIR / 'last_report_preview.html').write_text(html, encoding='utf-8')
-    if os.environ.get('DRY_RUN', 'false').lower() == 'true':
-        print('preview generated')
-        return
-    send_email(html, f"Informe diari de Rubí v2 - {report.target_date}")
-    print('sent')
+def main() -> int:
+    setup_logging()
+    try:
+        report = build_report()
+        html = render_html(report)
+        save_outputs(report, html)
+        if os.environ.get('DRY_RUN', 'false').lower() == 'true':
+            logging.info("DRY_RUN actiu: no s'envia el correu")
+            print(PREVIEW_FILE)
+            return 0
+        send_email(html, f"Informe diari de Rubi v3 - {report.target_date}")
+        logging.info("Informe enviat correctament")
+        return 0
+    except Exception as e:
+        logging.error("Execucio fallida: %s", e)
+        logging.error(traceback.format_exc())
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
